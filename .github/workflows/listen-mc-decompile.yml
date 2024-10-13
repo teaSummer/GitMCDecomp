@@ -1,0 +1,210 @@
+name: listen-mc-decompile
+on:
+  push:
+    paths:
+      - 'src/**'
+      - '.github/**'
+      - '**.gradle'
+  workflow_dispatch:
+
+#  If you can't post workflow_dispatch event, use this
+#  schedule:
+#    - cron: '0/5 * * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v3
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Run Gradle
+        run: |
+          chmod +x gradlew
+          ./gradlew clean shadowJar -s
+
+      - name: Upload Built JAR
+        uses: actions/upload-artifact@v3
+        with:
+          name: built-jar
+          path: build/libs/gitmc.jar
+
+  listen:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Check out Version Branch
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ secrets.DESTINATION }}
+          ref: version
+          ssh-key: ${{ secrets.DEPLOY_PRIVATE_KEY }}
+          path: version
+
+      - name: Set up Java
+        uses: actions/setup-java@v2
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Download Built JAR
+        uses: actions/download-artifact@v3
+        with:
+          name: built-jar
+          path: build/libs
+
+      - name: Check Minecraft version
+        run: |
+          java -cp build/libs/gitmc.jar io.github.nickid2018.gitmc.CheckMinecraft
+          chmod +x $GITHUB_WORKSPACE/output.sh
+          $GITHUB_WORKSPACE/output.sh
+
+      - name: Upload Remapped JAR
+        if: env.fail == 'false'
+        uses: actions/upload-artifact@v3
+        with:
+          name: remapped-jar
+          path: remapped.jar
+
+      - name: Check out Write Branch
+        if: env.fail == 'false'
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ secrets.DESTINATION }}
+          ref: ${{ env.branch_read }}
+          ssh-key: ${{ secrets.DEPLOY_PRIVATE_KEY }}
+          path: write
+
+      - name: Clean old version files
+        if: env.fail == 'false'
+        run: |
+          cd write
+          if [ -d "src/main/java" ]; then
+            rm -rf src/main/java
+          fi
+          mkdir -p src/main/java
+          if [ -d "src/main/resources" ]; then
+            rm -rf src/main/resources
+          fi
+          mkdir -p src/main/resources
+          cd ..
+
+      - name: Decompile Minecraft file (CFR, No Rename)
+        if: env.fail == 'false' && env.decompiler == 'cfr' && env.rename_var != 'decompiler'
+        run: java -cp build/libs/gitmc.jar org.benf.cfr.reader.Main --silent true --outputdir write/src/main/java --comments false --aggressivesizethreshold 20000 remapped.jar
+
+      - name: Decompile Minecraft file (CFR, Rename)
+        if: env.fail == 'false' && env.decompiler == 'cfr' && env.rename_var == 'decompiler'
+        run: java -cp build/libs/gitmc.jar org.benf.cfr.reader.Main --silent true --outputdir write/src/main/java --comments false --aggressivesizethreshold 20000 --usenametable false remapped.jar
+
+      - name: Decompile Minecraft file (Fernflower)
+        if: env.fail == 'false' && env.decompiler == 'fernflower'
+        run: |
+          mkdir decompiled
+          java -cp build/libs/gitmc.jar org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler -dgs=1 "-ind=    " -crp=1 -cps=1 -log=WARN remapped.jar decompiled
+          unzip -q -o decompiled/remapped.jar '*.java' -d write/src/main/java
+
+      - name: Resource files
+        if: env.fail == 'false'
+        run: |
+          unzip -q -o remapped.jar -x '*.class' -d write/src/main/resources
+          cd write/src/main/resources
+          for i in `find . -name "*.png" -type f`; do
+            sha1=`sha1sum $i | awk '{print $1}'`
+            echo $i $sha1 >> png-list.txt
+            rm $i
+          done
+          sort png-list.txt -o png-list.txt
+          for i in `find . -name "*.bin" -type f`; do
+            rm $i
+          done
+          for i in `find . -name "*.zip" -type f`; do
+            rm $i
+          done
+
+      - name: Convert NBT to SNBT
+        if: env.fail == 'false'
+        run: |
+          mkdir tempServer
+          cd tempServer
+          wget https://piston-data.mojang.com/v1/objects/8dd1a28015f51b1803213892b50b7b4fc76e594d/server.jar
+          java -DbundlerMainClass=net.minecraft.data.Main -jar server.jar --dev --input ../write/src/main/resources --output snbt
+          cp -r snbt/* ../write/src/main/resources
+          cd ../write/src/main/resources
+          for i in `find . -name "*.nbt" -type f`; do
+            rm $i
+          done
+          for i in `find . -name "*.snbt" -type f`; do
+            sed -i '/DataVersion/d' $i
+          done
+
+      - name: Move Build Gradle
+        if: env.fail == 'false'
+        run: |
+          mv gen-build.gradle write/build.gradle
+
+      - name: Switch Branch
+        if: env.branch_read != env.branch_write
+        run: |
+          cd write
+          git checkout -b ${{ env.branch_write }}
+          cd ..
+
+      - name: Commit new version files
+        if: env.fail == 'false'
+        run: |
+          cd write
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .
+          git commit -m ${{ env.version }} -a
+          cd ..
+
+      - name: Push new version files
+        if: env.fail == 'false'
+        uses: ad-m/github-push-action@master
+        with:
+          repository: ${{ secrets.DESTINATION }}
+          ssh: true
+          branch: ${{ env.branch_write }}
+          directory: write
+
+      - name: Commit version store file
+        if: env.fail == 'false'
+        run: |
+          echo ${{ env.version }} has been decompiled, now update version store json.
+          cd version
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .
+          git commit -m ${{ env.version }} -a
+          cd ..
+
+      - name: Push version store file
+        if: env.fail == 'false'
+        uses: ad-m/github-push-action@master
+        with:
+          repository: ${{ secrets.DESTINATION }}
+          ssh: true
+          branch: version
+          directory: version
+
+      - name: Summary Output (Success)
+        if: env.fail == 'false'
+        run: |
+          echo "### Decompile Success" >> $GITHUB_STEP_SUMMARY
+          echo "Decompile a new Minecraft version **${{ env.version }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Branch to write: ${{ env.branch_write }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Summary Output (Fail)
+        if: env.fail == 'true'
+        run: |
+          echo "### Minecraft version (${{ env.version }}) is latest!" >> $GITHUB_STEP_SUMMARY
